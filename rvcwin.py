@@ -17,6 +17,7 @@
 # ВНИМАНИЕ: fairseq2/fairseq2n на Windows обычно без готовых колес; используем HuBERT.
 #            (колеса fairseq2n официально только для Linux). см. ссылки в описании.
 #
+import copy
 import json
 import os
 import sys
@@ -256,26 +257,89 @@ def _sr_to_int(sr: str) -> int:
             pass
     return 48000
 
+def _build_default_config(root: str, project: str, sr: str) -> dict:
+    sr_value = _sr_to_int(sr)
+    sr_token = "48k" if sr_value == 48000 else sr
+    model_dir = logs_dir(root, project).replace("\\", "/")
+
+    config = {
+        "version": _resolve_version_from_sr(sr_token),
+        "name": project,
+        "gpus": "0",
+        "if_f0": 1,
+        "if_latest": 1,
+        "if_cache_data_in_gpu": 0,
+        "sample_rate": sr_value,
+        "model_dir": model_dir,
+        "experiment_dir": model_dir,
+        "train": copy.deepcopy(DEFAULT_TRAIN_BLOCK),
+        "data": copy.deepcopy(DEFAULT_DATA_BLOCK),
+        "model": copy.deepcopy(DEFAULT_MODEL_BLOCK),
+    }
+    config["data"]["sampling_rate"] = sr_value
+    config["data"]["training_files"] = f"{model_dir}/filelist.txt"
+    return config
+
+
+def _rewrite_config_with_defaults(
+    cfg_path: Path,
+    root: str,
+    project: str,
+    sr: str,
+    log,
+    existing: dict | None,
+) -> None:
+    merged = _build_default_config(root, project, sr)
+
+    if isinstance(existing, dict):
+        for key, value in existing.items():
+            if key in {"train", "data", "model"}:
+                continue
+            merged[key] = value
+
+        if isinstance(existing.get("train"), dict):
+            merged["train"].update(existing["train"])
+
+        if isinstance(existing.get("model"), dict):
+            merged["model"].update(existing["model"])
+
+        if isinstance(existing.get("data"), dict):
+            data_block = merged["data"]
+            for key, value in existing["data"].items():
+                if key in {"training_files", "sampling_rate"}:
+                    continue
+                data_block[key] = value
+
+    with cfg_path.open("w", encoding="utf-8") as fh:
+        json.dump(merged, fh, ensure_ascii=False, indent=2)
+    if log:
+        log(
+            "[INFO] config.json пересобран с обязательными секциями data/train/model (восстановление по умолчанию)."
+        )
+
 
 def _ensure_config_defaults(cfg_path: Path, root: str, project: str, sr: str, log) -> None:
+    sr_value = _sr_to_int(sr)
+    sr_token = "48k" if sr_value == 48000 else sr
+    model_dir = logs_dir(root, project).replace("\\", "/")
+    expected_filelist = f"{model_dir}/filelist.txt"
+
     try:
         with cfg_path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
     except Exception as exc:
         if log:
             log(f"[WARN] Не удалось проверить config.json: {exc}")
+        _rewrite_config_with_defaults(cfg_path, root, project, sr, log, existing=None)
         return
 
     if not isinstance(data, dict):
         if log:
-            log("[WARN] config.json имеет неожиданный формат — пропускаем правку.")
+            log("[WARN] config.json имеет неожиданный формат — пересобираем файл.")
+        _rewrite_config_with_defaults(cfg_path, root, project, sr, log, existing=None)
         return
 
     changed = False
-
-    sr_value = _sr_to_int(sr)
-    sr_token = "48k" if sr_value == 48000 else sr
-    model_dir = logs_dir(root, project).replace("\\", "/")
 
     top_level_defaults = {
         "version": _resolve_version_from_sr(sr_token),
@@ -316,7 +380,6 @@ def _ensure_config_defaults(cfg_path: Path, root: str, project: str, sr: str, lo
             data_block[key] = value if key != "sampling_rate" else sr_value
             changed = True
 
-    expected_filelist = f"{model_dir}/filelist.txt"
     if data_block.get("training_files") != expected_filelist:
         data_block["training_files"] = expected_filelist
         changed = True
@@ -342,6 +405,9 @@ def _ensure_config_defaults(cfg_path: Path, root: str, project: str, sr: str, lo
             return
         if log:
             log("[INFO] config.json дополнен обязательными секциями и значениями по умолчанию.")
+
+    if not isinstance(data.get("data"), dict):
+        _rewrite_config_with_defaults(cfg_path, root, project, sr, log, existing=data)
 
 
 def ensure_config_json(root: str, project: str, sr: str, log) -> Path:
