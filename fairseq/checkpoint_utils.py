@@ -10,6 +10,8 @@ from typing import Iterable, List, Tuple
 
 import torch
 
+from .data.dictionary import Dictionary
+
 try:
     import torchaudio  # type: ignore
 except Exception as exc:  # pragma: no cover - платформа без torchaudio
@@ -17,6 +19,14 @@ except Exception as exc:  # pragma: no cover - платформа без torchau
         "torchaudio обязателен для встроенной заглушки fairseq. "
         "Установите torchaudio (pip install torchaudio) перед извлечением фичей."
     ) from exc
+
+try:  # pragma: no cover - зависит от версии PyTorch
+    from torch.serialization import add_safe_globals
+except ImportError:  # PyTorch < 2.1
+    add_safe_globals = None  # type: ignore[assignment]
+
+if add_safe_globals is not None:
+    add_safe_globals([Dictionary])
 
 _LOGGER = logging.getLogger(__name__)
 
