@@ -23,7 +23,10 @@ _LOGGER = logging.getLogger(__name__)
 def _load_state_dict(path: Path) -> Tuple[dict, object]:
     """Загружает state_dict HuBERT из чекпойнта fairseq."""
 
-    ckpt = torch.load(str(path), map_location="cpu")
+    try:
+        ckpt = torch.load(str(path), map_location="cpu", weights_only=True)
+    except TypeError:
+        ckpt = torch.load(str(path), map_location="cpu")
     if isinstance(ckpt, dict):
         if "model" in ckpt and isinstance(ckpt["model"], dict):
             state_dict = ckpt["model"]
