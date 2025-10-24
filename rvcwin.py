@@ -113,6 +113,85 @@ def ensure_dirs(root, project):
     Path(datasets_dir(root, project)).mkdir(parents=True, exist_ok=True)
     Path(logs_dir(root, project)).mkdir(parents=True, exist_ok=True)
 
+
+def _normalize_sr_tokens(sr: str) -> list[str]:
+    """Возвращает возможные варианты имени конфигурации для указанного sample rate."""
+
+    sr_norm = str(sr or "").strip().lower()
+    tokens: list[str] = []
+    digits_only = re.sub(r"[^0-9]", "", sr_norm)
+    if digits_only:
+        tokens.append(digits_only)
+
+    if sr_norm.endswith("k"):
+        prefix = sr_norm[:-1]
+        if prefix.isdigit():
+            tokens.append(f"{prefix}k")
+            try:
+                tokens.append(str(int(prefix) * 1000))
+            except ValueError:
+                pass
+    else:
+        try:
+            as_int = int(sr_norm)
+        except ValueError:
+            as_int = None
+        if as_int:
+            tokens.append(str(as_int))
+            if as_int % 1000 == 0:
+                tokens.append(f"{as_int // 1000}k")
+
+    if not tokens:
+        tokens.append("48k")
+        tokens.append("48000")
+
+    # Удалим дубликаты, сохранив порядок
+    seen: set[str] = set()
+    result: list[str] = []
+    for token in tokens:
+        if token and token not in seen:
+            seen.add(token)
+            result.append(token)
+    return result
+
+
+def ensure_config_json(root: str, project: str, sr: str, log) -> Path:
+    """Создаёт logs/<project>/config.json из шаблона, если файл отсутствует."""
+
+    logs_path = Path(logs_dir(root, project))
+    cfg_path = logs_path / "config.json"
+    if cfg_path.exists():
+        if log:
+            log("config.json уже существует — пропускаем копирование шаблона.")
+        return cfg_path
+
+    repo = Path(webui_root(root))
+    candidates: list[Path] = []
+    for token in _normalize_sr_tokens(sr):
+        candidates.append(repo / "configs" / f"{token}.json")
+        candidates.append(repo / "configs" / f"{token}_v2.json")
+        candidates.append(repo / "configs" / f"{token}_v1.json")
+
+    # На случай, если названия шаблонов отличаются от стандартных.
+    candidates.append(repo / "configs" / "48k_v2.json")
+    candidates.append(repo / "configs" / "config.json")
+
+    template = next((path for path in candidates if path.exists()), None)
+    if template is None:
+        raise FileNotFoundError(
+            "Не найден шаблон конфигурации (configs/<sr>.json) в WebUI."
+        )
+
+    logs_path.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(template, cfg_path)
+    try:
+        rel_template = template.relative_to(repo)
+    except ValueError:
+        rel_template = template
+    if log:
+        log(f"Создан config.json из шаблона {rel_template}.")
+    return cfg_path
+
 def is_git_repo(path: str) -> bool:
     return Path(os.path.join(path, ".git")).exists()
 
@@ -458,6 +537,9 @@ def find_trainer_script(repo_dir: str) -> str | None:
 
 
 def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", te="300", se="25"):
+    ensure_dirs(root, project)
+    ensure_config_json(root, project, sr, log)
+
     repo = webui_root(root)
     g, d = pretrained_snowie_paths(root)
 
