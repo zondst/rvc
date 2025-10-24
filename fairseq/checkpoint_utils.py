@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Iterable, List, Tuple
 
 import torch
+from torch import Tensor, nn
 
 from .data.dictionary import Dictionary
 
@@ -29,6 +30,66 @@ if add_safe_globals is not None:
     add_safe_globals([Dictionary])
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class _FairseqHubertAdapter(nn.Module):
+    """Обёртка, эмулирующая интерфейс fairseq для torchaudio HuBERT."""
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+        # В fairseq final_proj применяется только для версии v1; Identity достаточно.
+        self.final_proj = nn.Identity()
+
+    def __getattr__(self, name: str):  # pragma: no cover - проброс атрибутов
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.model, name)
+
+    @staticmethod
+    def _mask_to_lengths(mask: Tensor | None, batch: int, total_length: int) -> Tensor | None:
+        if mask is None:
+            return torch.full((batch,), total_length, dtype=torch.int64)
+        if mask.dim() != 2:
+            raise ValueError("padding_mask должен иметь 2 измерения")
+        return (~mask.bool()).sum(dim=1, dtype=torch.int64)
+
+    def extract_features(
+        self,
+        *,
+        source: Tensor,
+        padding_mask: Tensor | None = None,
+        output_layer: int | None = None,
+        **_: object,
+    ) -> Tuple[Tensor, dict]:
+        if source.dtype not in (torch.float32, torch.float64):
+            source = source.float()
+        lengths = self._mask_to_lengths(padding_mask, source.size(0), source.size(1))
+        if lengths is not None:
+            lengths = lengths.to(source.device)
+
+        num_layers = int(output_layer) if output_layer else None
+        layer_outputs, layer_lengths = self.model.extract_features(
+            source,
+            lengths=lengths,
+            num_layers=num_layers,
+        )
+
+        if isinstance(layer_outputs, list) and layer_outputs:
+            features = layer_outputs[-1]
+        else:
+            features = source.new_empty(0)
+
+        extra = {
+            "layer_results": tuple({"x": layer} for layer in layer_outputs) if isinstance(layer_outputs, list) else (),
+            "padding_mask": padding_mask,
+            "layer_lengths": layer_lengths,
+        }
+        return features, extra
+
+    def forward(self, *args, **kwargs):  # pragma: no cover - совместимость
+        return self.model(*args, **kwargs)
 
 
 def _load_state_dict(path: Path) -> Tuple[dict, object]:
@@ -104,9 +165,9 @@ def load_model_ensemble_and_task(
     state_dict, cfg = _load_state_dict(path)
 
     bundle = torchaudio.pipelines.HUBERT_BASE
-    model = bundle.get_model()
+    base_model = bundle.get_model()
 
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = base_model.load_state_dict(state_dict, strict=False)
     if missing:
         _LOGGER.debug("HuBERT state_dict: отсутствуют ключи: %s", sorted(missing))
     if unexpected:
@@ -115,6 +176,8 @@ def load_model_ensemble_and_task(
     normalize = _extract_normalize_flag(cfg)
     saved_cfg = SimpleNamespace(task=SimpleNamespace(normalize=normalize))
     task = SimpleNamespace(cfg=SimpleNamespace(normalize=normalize))
+
+    model = _FairseqHubertAdapter(base_model)
 
     return [model], saved_cfg, task
 
