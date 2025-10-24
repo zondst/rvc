@@ -27,6 +27,7 @@ import subprocess
 import threading
 import queue
 import glob
+from typing import Dict
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -70,11 +71,15 @@ def rmvpe_model_dir(root: str) -> str:
 def rmvpe_path(root: str) -> str:
     return os.path.join(rmvpe_model_dir(root), "rmvpe.pt")
 
+
+def pretrained_official_paths(root: str) -> tuple[str, str]:
+    base = os.path.join(assets_dir(root), "pretrained_v2")
+    return os.path.join(base, "f0G48k.pth"), os.path.join(base, "f0D48k.pth")
+
+
 # Универсальный запуск подпроцессов с UTF-8 окружением
-def run_stream(cmd, cwd=None, log_fn=None):
-    # cmd: list[str] либо str; предпочтем list
-    if not isinstance(cmd, (list, tuple)):
-        cmd = cmd.split()
+def _build_process_env(extra: Dict[str, str] | None = None) -> Dict[str, str]:
+    """Возвращает окружение для подпроцессов WebUI, дружелюбное к Windows."""
 
     env = os.environ.copy()
     # Принудительно включаем UTF-8 в дочерних процессах, чтобы не ловить UnicodeDecodeError
@@ -84,11 +89,29 @@ def run_stream(cmd, cwd=None, log_fn=None):
     # Hugging Face: глушим ворнинг про симлинки, это норм на Windows
     env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
+    # USE_LIBUV=0 — обязательное условие, чтобы gloo не падал на Windows.
+    env.setdefault("USE_LIBUV", "0")
+
     # Обеспечим доступ к дополнительным модулям (заглушка fairseq и т.д.)
     current_dir = str(Path(__file__).resolve().parent)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [p for p in (current_dir, env.get("PYTHONPATH", "")) if p]
-    )
+    existing = env.get("PYTHONPATH", "")
+    paths = [current_dir]
+    if existing:
+        paths.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join([p for p in paths if p])
+
+    if extra:
+        env.update(extra)
+
+    return env
+
+
+def run_stream(cmd, cwd=None, log_fn=None):
+    # cmd: list[str] либо str; предпочтем list
+    if not isinstance(cmd, (list, tuple)):
+        cmd = cmd.split()
+
+    env = _build_process_env()
 
     p = subprocess.Popen(
         cmd,
@@ -112,6 +135,7 @@ def ensure_dirs(root, project):
     Path(assets_dir(root)).mkdir(parents=True, exist_ok=True)
     Path(hubert_dir(root)).mkdir(parents=True, exist_ok=True)
     Path(rmvpe_model_dir(root)).mkdir(parents=True, exist_ok=True)
+    Path(os.path.join(assets_dir(root), "pretrained_v2")).mkdir(parents=True, exist_ok=True)
     Path(os.path.join(assets_dir(root), "pretrained_v2", "48k", "Snowie")).mkdir(parents=True, exist_ok=True)
     Path(datasets_dir(root, project)).mkdir(parents=True, exist_ok=True)
     Path(logs_dir(root, project)).mkdir(parents=True, exist_ok=True)
@@ -506,7 +530,27 @@ def download_assets(root: str, log):
     else:
         log("Есть: rmvpe.pt")
 
-    # Предтрен Snowie v3.1 48k (G/D)
+    # Официальные предтрен-веса RVC v2 (f0G/f0D 48k)
+    official_pairs = {
+        "f0G48k.pth": "pretrained_v2/f0G48k.pth",
+        "f0D48k.pth": "pretrained_v2/f0D48k.pth",
+    }
+    official_dir = Path(os.path.join(assets_dir(root), "pretrained_v2"))
+    official_dir.mkdir(parents=True, exist_ok=True)
+    for fn, remote in official_pairs.items():
+        dst = official_dir / fn
+        if not dst.exists():
+            p = hf_hub_download(
+                repo_id="lj1995/VoiceConversionWebUI",
+                filename=remote,
+                repo_type="model",
+            )
+            shutil.copy2(p, dst)
+            log(f"OK: {fn}")
+        else:
+            log(f"Есть: {fn}")
+
+    # Предтрен Snowie v3.1 48k (G/D) — оставляем как дополнительный вариант
     for fn in ["G_SnowieV3.1_48k.pth", "D_SnowieV3.1_48k.pth"]:
         dst = os.path.join(assets_dir(root), "pretrained_v2", "48k", "Snowie", fn)
         if not Path(dst).exists():
@@ -870,6 +914,61 @@ def find_trainer_script(repo_dir: str) -> str | None:
     return None
 
 
+def ensure_trainer_pretrain_patch(trainer_path: str, log) -> None:
+    """Патчит загрузку предтренов, чтобы поддерживать несовместимые веса."""
+
+    try:
+        text = Path(trainer_path).read_text(encoding="utf-8")
+    except Exception as exc:
+        log(f"[WARN] Не удалось прочитать {trainer_path}: {exc}")
+        return
+
+    if "load_state_dict(sd, strict=False)" in text:
+        # Патч уже применён
+        return
+
+    pattern = re.compile(
+        r"(?P<indent>^[ \t]*)(?P<prefix>net_[gd](?:\.module)?)\.load_state_dict\(\s*torch\.load\((?P<args>[^)]*)\)"
+        r"(?P<tail>\[[^\]]+\])?\s*\)",
+        re.MULTILINE,
+    )
+
+    def repl(match: re.Match[str]) -> str:
+        indent = match.group("indent")
+        prefix = match.group("prefix")
+        args = match.group("args").strip()
+
+        if "weights_only" not in args:
+            if args.endswith(","):
+                args = f"{args} weights_only=True"
+            elif args:
+                args = f"{args}, weights_only=True"
+            else:
+                args = "weights_only=True"
+
+        body = [
+            f"{indent}sd = torch.load({args})",
+            f'{indent}sd = sd.get("model", sd)',
+            f"{indent}{prefix}.load_state_dict(sd, strict=False)",
+        ]
+        return "\n".join(body)
+
+    new_text, count = pattern.subn(repl, text)
+
+    if count == 0:
+        log("[WARN] Не удалось автоматически пропатчить загрузку предтренов — используйте официальные веса.")
+        return
+
+    try:
+        Path(trainer_path).write_text(new_text, encoding="utf-8")
+    except Exception as exc:
+        log(f"[WARN] Не удалось записать патч в {trainer_path}: {exc}")
+        return
+
+    log("Применён патч загрузки предтренов (strict=False + weights_only=True).")
+
+
+
 def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", te="300", se="25"):
     ensure_dirs(root, project)
     ensure_config_json(root, project, sr, log)
@@ -877,7 +976,23 @@ def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", 
     log(f"Используем filelist: {filelist_path}")
 
     repo = webui_root(root)
-    g, d = pretrained_snowie_paths(root)
+    g_official, d_official = pretrained_official_paths(root)
+    g_snowie, d_snowie = pretrained_snowie_paths(root)
+
+    g: str | None = None
+    d: str | None = None
+    if Path(g_official).exists() and Path(d_official).exists():
+        g, d = g_official, d_official
+        log("Используем официальные веса RVC v2: f0G48k/f0D48k.")
+    elif Path(g_official).exists() or Path(d_official).exists():
+        log("[WARN] Найдена только часть официальных весов (f0G48k/f0D48k). Дополните комплект.")
+
+    if g is None and Path(g_snowie).exists() and Path(d_snowie).exists():
+        g, d = g_snowie, d_snowie
+        log("Используем Snowie v3.1 как предтрен (fallback).")
+
+    if g is None or d is None:
+        log("[WARN] Предтрен-веса не найдены — обучение стартует с нуля.")
 
     def detect_trainer_capabilities(path: str, repo_dir: str) -> set[str]:
         """Читает тренировочный скрипт и определяет доступные параметры CLI."""
@@ -901,11 +1016,6 @@ def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", 
         missing = [key for key in markers if key not in capabilities]
         if missing:
             # Попробуем запросить справку по CLI, чтобы учесть параметры, добавляемые динамически.
-            env = os.environ.copy()
-            env["PYTHONUTF8"] = "1"
-            env["PYTHONIOENCODING"] = "utf-8"
-            env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-
             try:
                 proc = subprocess.run(
                     [sys.executable, path, "-h"],
@@ -913,7 +1023,7 @@ def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", 
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
-                    env=env,
+                    env=_build_process_env(),
                     check=False,
                 )
             except Exception:
@@ -938,8 +1048,7 @@ def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", 
     else:
         log(f"Тренировочный скрипт: {os.path.relpath(trainer, repo)}")
 
-    if not Path(g).exists() or not Path(d).exists():
-        log("[WARN] Предтрен Snowie не найден — обучение запустится с нуля.")
+    ensure_trainer_pretrain_patch(trainer, log)
 
     cli_capabilities = detect_trainer_capabilities(trainer, repo)
     if cli_capabilities:
@@ -957,9 +1066,9 @@ def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", 
         "-te", te,
         "-se", se
     ]
-    if Path(g).exists():
+    if g and Path(g).exists():
         cmd += ["-pg", g]
-    if Path(d).exists():
+    if d and Path(d).exists():
         cmd += ["-pd", d]
 
     applied_flags: list[str] = []
@@ -991,11 +1100,7 @@ def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", 
     if not isinstance(cmd, (list, tuple)):
         cmd = cmd.split()
 
-    env = os.environ.copy()
-    env["PYTHONUTF8"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-
+    env = _build_process_env()
     p = subprocess.Popen(
         cmd, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         universal_newlines=True, encoding="utf-8", env=env,
