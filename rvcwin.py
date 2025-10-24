@@ -173,6 +173,36 @@ DEFAULT_TRAIN_BLOCK = {
     "c_kl": 1.0,
 }
 
+DEFAULT_DATA_BLOCK = {
+    "max_wav_value": 32768.0,
+    "sampling_rate": 48000,
+    "filter_length": 2048,
+    "hop_length": 480,
+    "win_length": 2048,
+    "n_mel_channels": 128,
+    "mel_fmin": 0.0,
+    "mel_fmax": None,
+}
+
+DEFAULT_MODEL_BLOCK = {
+    "inter_channels": 192,
+    "hidden_channels": 192,
+    "filter_channels": 768,
+    "n_heads": 2,
+    "n_layers": 6,
+    "kernel_size": 3,
+    "p_dropout": 0.0,
+    "resblock": "1",
+    "resblock_kernel_sizes": [3, 7, 11],
+    "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+    "upsample_rates": [10, 10, 2, 2],
+    "upsample_initial_channel": 512,
+    "upsample_kernel_sizes": [16, 16, 4, 4],
+    "use_spectral_norm": False,
+    "gin_channels": 256,
+    "spk_embed_dim": 109,
+}
+
 
 def _iter_config_templates(repo: Path, sr: str):
     tokens = _normalize_sr_tokens(sr)
@@ -211,7 +241,23 @@ def _config_has_train(path: Path) -> bool:
     return isinstance(data, dict) and isinstance(data.get("train"), dict)
 
 
-def _ensure_train_block(cfg_path: Path, log) -> None:
+def _sr_to_int(sr: str) -> int:
+    sr = (sr or "").strip().lower()
+    digits = re.sub(r"[^0-9]", "", sr)
+    if sr.endswith("k"):
+        try:
+            return int(float(sr[:-1]) * 1000)
+        except Exception:
+            pass
+    if digits:
+        try:
+            return int(digits)
+        except Exception:
+            pass
+    return 48000
+
+
+def _ensure_config_defaults(cfg_path: Path, root: str, project: str, sr: str, log) -> None:
     try:
         with cfg_path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -225,8 +271,30 @@ def _ensure_train_block(cfg_path: Path, log) -> None:
             log("[WARN] config.json имеет неожиданный формат — пропускаем правку.")
         return
 
-    train = data.get("train")
     changed = False
+
+    sr_value = _sr_to_int(sr)
+    sr_token = "48k" if sr_value == 48000 else sr
+    model_dir = logs_dir(root, project).replace("\\", "/")
+
+    top_level_defaults = {
+        "version": _resolve_version_from_sr(sr_token),
+        "name": project,
+        "gpus": "0",
+        "if_f0": 1,
+        "if_latest": 1,
+        "if_cache_data_in_gpu": 0,
+        "sample_rate": sr_value,
+        "model_dir": model_dir,
+        "experiment_dir": model_dir,
+    }
+
+    for key, value in top_level_defaults.items():
+        if key not in data:
+            data[key] = value
+            changed = True
+
+    train = data.get("train")
     if not isinstance(train, dict):
         train = {}
         data["train"] = train
@@ -235,6 +303,33 @@ def _ensure_train_block(cfg_path: Path, log) -> None:
     for key, value in DEFAULT_TRAIN_BLOCK.items():
         if key not in train:
             train[key] = value
+            changed = True
+
+    data_block = data.get("data")
+    if not isinstance(data_block, dict):
+        data_block = {}
+        data["data"] = data_block
+        changed = True
+
+    for key, value in DEFAULT_DATA_BLOCK.items():
+        if key not in data_block:
+            data_block[key] = value if key != "sampling_rate" else sr_value
+            changed = True
+
+    expected_filelist = f"{model_dir}/filelist.txt"
+    if data_block.get("training_files") != expected_filelist:
+        data_block["training_files"] = expected_filelist
+        changed = True
+
+    model_block = data.get("model")
+    if not isinstance(model_block, dict):
+        model_block = {}
+        data["model"] = model_block
+        changed = True
+
+    for key, value in DEFAULT_MODEL_BLOCK.items():
+        if key not in model_block:
+            model_block[key] = value
             changed = True
 
     if changed:
@@ -246,7 +341,7 @@ def _ensure_train_block(cfg_path: Path, log) -> None:
                 log(f"[WARN] Не удалось обновить config.json: {exc}")
             return
         if log:
-            log("[INFO] Секция train дополнена значениями по умолчанию.")
+            log("[INFO] config.json дополнен обязательными секциями и значениями по умолчанию.")
 
 
 def ensure_config_json(root: str, project: str, sr: str, log) -> Path:
@@ -257,7 +352,7 @@ def ensure_config_json(root: str, project: str, sr: str, log) -> Path:
     if cfg_path.exists():
         if log:
             log("config.json уже существует — пропускаем копирование шаблона.")
-        _ensure_train_block(cfg_path, log)
+        _ensure_config_defaults(cfg_path, root, project, sr, log)
         return cfg_path
 
     repo = Path(webui_root(root))
@@ -288,7 +383,7 @@ def ensure_config_json(root: str, project: str, sr: str, log) -> Path:
     if log:
         log(f"Создан config.json из шаблона {rel_template}.")
 
-    _ensure_train_block(cfg_path, log)
+    _ensure_config_defaults(cfg_path, root, project, sr, log)
     return cfg_path
 
 def is_git_repo(path: str) -> bool:
