@@ -461,7 +461,7 @@ def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", 
     repo = webui_root(root)
     g, d = pretrained_snowie_paths(root)
 
-    def detect_trainer_capabilities(path: str) -> set[str]:
+    def detect_trainer_capabilities(path: str, repo_dir: str) -> set[str]:
         """Читает тренировочный скрипт и определяет доступные параметры CLI."""
 
         try:
@@ -479,6 +479,37 @@ def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", 
         for key, marker in markers.items():
             if marker in text:
                 capabilities.add(key)
+
+        missing = [key for key in markers if key not in capabilities]
+        if missing:
+            # Попробуем запросить справку по CLI, чтобы учесть параметры, добавляемые динамически.
+            env = os.environ.copy()
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
+            try:
+                proc = subprocess.run(
+                    [sys.executable, path, "-h"],
+                    cwd=repo_dir,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    env=env,
+                    check=False,
+                )
+            except Exception:
+                proc = None
+
+            if proc is not None:
+                help_output = "".join(
+                    part for part in (proc.stdout or "", proc.stderr or "")
+                )
+                for key in list(missing):
+                    if markers[key] in help_output:
+                        capabilities.add(key)
+                        missing.remove(key)
+
         return capabilities
 
     trainer = find_trainer_script(repo)
@@ -492,7 +523,9 @@ def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", 
     if not Path(g).exists() or not Path(d).exists():
         log("[WARN] Предтрен Snowie не найден — обучение запустится с нуля.")
 
-    cli_capabilities = detect_trainer_capabilities(trainer)
+    cli_capabilities = detect_trainer_capabilities(trainer, repo)
+    if cli_capabilities:
+        log("Доступные флаги обучения: " + ", ".join(sorted(cli_capabilities)))
     version = _resolve_version_from_sr(sr)
 
     # Формат параметров встречается одинаковый в разных форках:
