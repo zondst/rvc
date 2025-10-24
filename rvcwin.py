@@ -48,8 +48,18 @@ def logs_dir(root: str, project: str) -> str:
     return os.path.join(webui_root(root), "logs", project)
 
 # Полезные пути с весами
+def hubert_dir(root: str) -> str:
+    return os.path.join(assets_dir(root), "hubert")
+
+
 def hubert_path(root: str) -> str:
-    return os.path.join(assets_dir(root), "hubert_base.pt")  # классический путь
+    # Современные форки WebUI ожидают файл в assets/hubert/hubert_base.pt
+    return os.path.join(hubert_dir(root), "hubert_base.pt")
+
+
+def legacy_hubert_path(root: str) -> str:
+    # Старые версии искали hubert_base.pt непосредственно в assets/
+    return os.path.join(assets_dir(root), "hubert_base.pt")
 
 def rmvpe_model_dir(root: str) -> str:
     return os.path.join(assets_dir(root), "rmvpe")  # важно: именно assets/rmvpe
@@ -71,6 +81,12 @@ def run_stream(cmd, cwd=None, log_fn=None):
     # Hugging Face: глушим ворнинг про симлинки, это норм на Windows
     env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
+    # Обеспечим доступ к дополнительным модулям (заглушка fairseq и т.д.)
+    current_dir = str(Path(__file__).resolve().parent)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [p for p in (current_dir, env.get("PYTHONPATH", "")) if p]
+    )
+
     p = subprocess.Popen(
         cmd,
         cwd=cwd,
@@ -91,6 +107,7 @@ def ensure_dirs(root, project):
     Path(root).mkdir(parents=True, exist_ok=True)
     Path(os.path.join(root, "input")).mkdir(parents=True, exist_ok=True)
     Path(assets_dir(root)).mkdir(parents=True, exist_ok=True)
+    Path(hubert_dir(root)).mkdir(parents=True, exist_ok=True)
     Path(rmvpe_model_dir(root)).mkdir(parents=True, exist_ok=True)
     Path(os.path.join(assets_dir(root), "pretrained_v2", "48k", "Snowie")).mkdir(parents=True, exist_ok=True)
     Path(datasets_dir(root, project)).mkdir(parents=True, exist_ok=True)
@@ -125,12 +142,21 @@ def download_assets(root: str, log):
         raise
 
     # HuBERT (dataset)
-    if not Path(hubert_path(root)).exists():
-        p = hf_hub_download(repo_id="AI-C/rvc-models", filename="hubert_base.pt", repo_type="dataset")
-        shutil.copy2(p, hubert_path(root))
+    hub_dst = Path(hubert_path(root))
+    legacy_dst = Path(legacy_hubert_path(root))
+    if not hub_dst.exists():
+        p = hf_hub_download(
+            repo_id="AI-C/rvc-models", filename="hubert_base.pt", repo_type="dataset"
+        )
+        shutil.copy2(p, hub_dst)
         log("OK: hubert_base.pt")
     else:
         log("Есть: hubert_base.pt")
+    if hub_dst.exists() and not legacy_dst.exists():
+        try:
+            shutil.copy2(hub_dst, legacy_dst)
+        except Exception as exc:
+            log(f"[WARN] Не удалось продублировать hubert_base.pt в assets/: {exc}")
 
     # RMVPE (model) — кладём строго в assets/rmvpe/rmvpe.pt
     if not Path(rmvpe_path(root)).exists():
@@ -317,6 +343,8 @@ def detect_feat_signature(repo_dir: str) -> str:
 
     # Признаки parted-варианта (как в rvc-playground):
     if re.search(r"i_part\s*=\s*int\(sys\.argv\[3\]\)", text) and ("n_part" in text):
+        if re.search(r"sys\.argv\[\s*8\s*\]", text):
+            return "parts_hubert"
         return "parts"
 
     # Признак «классики»: начало с use_gpu/i_gpu/exp_dir/sr/n_threads/... (встречается в старых ветках)
@@ -335,15 +363,20 @@ def extract_features(root: str, project: str, sr: str, log, gpu_index="0"):
     sig = detect_feat_signature(repo)
     # На Windows fairseq2/fairseq2n почти всегда недоступен — используем HuBERT
     # (Даже если импорт fairseq2 пройдёт, в большинстве форков auto-switch уже внутри скрипта.)
+    version = "v2" if str(sr).strip().lower() in {"48k", "48000"} else "v1"
     if sig == "parts":
-        # Пример распространённой сигнатуры parted:
-        # python extract_feature_print.py <device> <n_part> <i_part> <i_gpu> <exp_dir> <is_half> <sr> [hubert]
+        # python extract_feature_print.py <device> <n_part> <i_part> <i_gpu> <exp_dir> <version> <is_half>
         cmd = [
             sys.executable, os.path.join("infer", "modules", "train", "extract_feature_print.py"),
-            "cuda", "1", "0", gpu_index, logs_dir(root, project), "False", sr, hub
+            "cuda", "1", "0", gpu_index, logs_dir(root, project), version, "False"
+        ]
+    elif sig == "parts_hubert":
+        # python extract_feature_print.py <device> <n_part> <i_part> <i_gpu> <exp_dir> <version> <is_half> <hubert_path>
+        cmd = [
+            sys.executable, os.path.join("infer", "modules", "train", "extract_feature_print.py"),
+            "cuda", "1", "0", gpu_index, logs_dir(root, project), version, "False", hub
         ]
     else:
-        # Классическая сигнатура:
         # python extract_feature_print.py <use_gpu> <i_gpu> <exp_dir> <sr> <n_threads> <hubert_path>
         cmd = [
             sys.executable, os.path.join("infer", "modules", "train", "extract_feature_print.py"),
