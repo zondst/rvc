@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import pickle
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterable, List, Tuple
@@ -26,6 +27,15 @@ def _load_state_dict(path: Path) -> Tuple[dict, object]:
     try:
         ckpt = torch.load(str(path), map_location="cpu", weights_only=True)
     except TypeError:
+        ckpt = torch.load(str(path), map_location="cpu")
+    except pickle.UnpicklingError as exc:
+        _LOGGER.warning(
+            "HuBERT checkpoint %s нельзя загрузить с weights_only=True (%s). "
+            "Падает обратно на weights_only=False. Убедитесь, что чекпойнт получен "
+            "из доверенного источника.",
+            path,
+            exc,
+        )
         ckpt = torch.load(str(path), map_location="cpu")
     if isinstance(ckpt, dict):
         if "model" in ckpt and isinstance(ckpt["model"], dict):
