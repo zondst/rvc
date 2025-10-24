@@ -354,6 +354,15 @@ def detect_feat_signature(repo_dir: str) -> str:
     # fallback: попробуем classic
     return "classic"
 
+def _resolve_version_from_sr(sr: str) -> str:
+    """Возвращает версию модели (v1/v2) на основе частоты дискретизации."""
+
+    sr_norm = str(sr).strip().lower()
+    if sr_norm in {"48k", "48000", "48khz"}:
+        return "v2"
+    return "v1"
+
+
 def extract_features(root: str, project: str, sr: str, log, gpu_index="0"):
     repo = webui_root(root)
     hub = hubert_path(root)
@@ -363,7 +372,7 @@ def extract_features(root: str, project: str, sr: str, log, gpu_index="0"):
     sig = detect_feat_signature(repo)
     # На Windows fairseq2/fairseq2n почти всегда недоступен — используем HuBERT
     # (Даже если импорт fairseq2 пройдёт, в большинстве форков auto-switch уже внутри скрипта.)
-    version = "v2" if str(sr).strip().lower() in {"48k", "48000"} else "v1"
+    version = _resolve_version_from_sr(sr)
     if sig == "parts":
         # python extract_feature_print.py <device> <n_part> <i_part> <i_gpu> <exp_dir> <version> <is_half>
         cmd = [
@@ -452,6 +461,26 @@ def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", 
     repo = webui_root(root)
     g, d = pretrained_snowie_paths(root)
 
+    def detect_trainer_capabilities(path: str) -> set[str]:
+        """Читает тренировочный скрипт и определяет доступные параметры CLI."""
+
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return set()
+
+        capabilities = set()
+        markers = {
+            "version": "--version",
+            "if_latest": "--if_latest",
+            "if_cache_data_in_gpu": "--if_cache_data_in_gpu",
+            "save_every_weights": "--save_every_weights",
+        }
+        for key, marker in markers.items():
+            if marker in text:
+                capabilities.add(key)
+        return capabilities
+
     trainer = find_trainer_script(repo)
     if trainer is None:
         raise FileNotFoundError(
@@ -462,6 +491,9 @@ def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", 
 
     if not Path(g).exists() or not Path(d).exists():
         log("[WARN] Предтрен Snowie не найден — обучение запустится с нуля.")
+
+    cli_capabilities = detect_trainer_capabilities(trainer)
+    version = _resolve_version_from_sr(sr)
 
     # Формат параметров встречается одинаковый в разных форках:
     # -e <эксперимент>, -sr <48k>, -f0 <0/1>, -bs <batch>, -te <total_epochs>, -se <save_every>, -pg/-pd (pretrained)
@@ -478,6 +510,26 @@ def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", 
         cmd += ["-pg", g]
     if Path(d).exists():
         cmd += ["-pd", d]
+
+    applied_flags: list[str] = []
+    if "version" in cli_capabilities:
+        cmd += ["-v", version]
+        applied_flags.append(f"version={version}")
+    if "if_latest" in cli_capabilities:
+        # Загружаем последний чекпоинт, если он существует, чтобы продолжить обучение.
+        cmd += ["-l", "1"]
+        applied_flags.append("if_latest=1")
+    if "if_cache_data_in_gpu" in cli_capabilities:
+        # Для экономии памяти по умолчанию отключаем кеширование датасета в GPU.
+        cmd += ["-c", "0"]
+        applied_flags.append("if_cache_data_in_gpu=0")
+    if "save_every_weights" in cli_capabilities and "-sw" not in cmd:
+        # Сохраняем только контрольные точки по расписанию, без лишних весов.
+        cmd += ["-sw", "0"]
+        applied_flags.append("save_every_weights=0")
+
+    if applied_flags:
+        log("Оптимизированные флаги обучения: " + ", ".join(applied_flags))
 
     # Чтобы показать прогресс эпох — будем парсить stdout
     epoch_re = re.compile(r"epoch[^0-9]*([0-9]+)\s*[/|]\s*([0-9]+)", re.I)
