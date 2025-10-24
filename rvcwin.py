@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import threading
 import queue
+import glob
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -609,6 +610,79 @@ def slice_and_copy_dataset(root: str, project: str, input_wav: str, sr: str, log
     log(f"Готово: скопировано в {gt_dir}")
     log(f"Готово: создано {wav16_dir}")
 
+
+def _feature_dir_for_sr(sr: str) -> str:
+    """Определяем имя папки с фичами на основе версии модели."""
+
+    version = _resolve_version_from_sr(sr)
+    if version == "v2":
+        return "3_feature768"
+    return "3_feature256"
+
+
+def generate_filelist(root: str, project: str, sr: str, log, speaker_id: str = "0") -> Path:
+    """Создаёт logs/<project>/filelist.txt в формате RVC v2/v1."""
+
+    exp_dir = Path(logs_dir(root, project))
+    gt_dir = exp_dir / "0_gt_wavs"
+    feat_dir = exp_dir / _feature_dir_for_sr(sr)
+    f0_dir = exp_dir / "2a_f0"
+    f0nsf_dir = exp_dir / "2b-f0nsf"
+
+    for required in [gt_dir, feat_dir, f0_dir, f0nsf_dir]:
+        if not required.exists():
+            raise FileNotFoundError(f"Требуемая папка не найдена: {required}")
+
+    wav_paths = sorted(glob.glob(str(gt_dir / "*.wav")))
+    if not wav_paths:
+        raise FileNotFoundError(f"Не найдены WAV-файлы в {gt_dir}")
+
+    lines: list[str] = []
+    missing: list[tuple[str, list[str]]] = []
+
+    for wav_path in wav_paths:
+        base = Path(wav_path).stem
+        feat_path = feat_dir / f"{base}.npy"
+        f0_path = f0_dir / f"{base}.wav.npy"
+        f0nsf_path = f0nsf_dir / f"{base}.wav.npy"
+        candidates = [feat_path, f0_path, f0nsf_path]
+        if all(p.exists() for p in candidates):
+            line = "|".join(
+                [
+                    wav_path,
+                    str(feat_path),
+                    str(f0_path),
+                    str(f0nsf_path),
+                    str(speaker_id),
+                ]
+            )
+            lines.append(line)
+        else:
+            missing.append(
+                (
+                    base,
+                    [str(p) for p in candidates if not p.exists()],
+                )
+            )
+
+    filelist_path = exp_dir / "filelist.txt"
+    filelist_path.parent.mkdir(parents=True, exist_ok=True)
+    with filelist_path.open("w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+
+    log(f"Создан filelist.txt со строками: {len(lines)}")
+    if missing:
+        log("[WARN] Для части семплов отсутствуют фичи/F0:")
+        for base, miss in missing:
+            log("  - " + base)
+            for item in miss:
+                log("    * " + item)
+
+    if not lines:
+        raise RuntimeError("filelist.txt пуст — проверьте генерацию фичей и F0")
+
+    return filelist_path
+
 def preprocess_with_webui(root: str, project: str, sr: str, log):
     """Запуск trainset_preprocess_xxx.py (если есть). Иначе пропускаем (мы уже нарезали)."""
     repo = webui_root(root)
@@ -799,6 +873,8 @@ def find_trainer_script(repo_dir: str) -> str | None:
 def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", te="300", se="25"):
     ensure_dirs(root, project)
     ensure_config_json(root, project, sr, log)
+    filelist_path = generate_filelist(root, project, sr, log)
+    log(f"Используем filelist: {filelist_path}")
 
     repo = webui_root(root)
     g, d = pretrained_snowie_paths(root)
@@ -998,7 +1074,8 @@ class App:
         tk.Button(btns, text="3) Препроцесс WebUI (если есть)", command=self.step_3).pack(side="left", padx=4)
         tk.Button(btns, text="4) Извлечь F0", command=self.step_4).pack(side="left", padx=4)
         tk.Button(btns, text="5) Извлечь фичи", command=self.step_5).pack(side="left", padx=4)
-        tk.Button(btns, text="6) Обучение (start/continue)", command=self.step_6).pack(side="left", padx=4)
+        tk.Button(btns, text="6) Сгенерировать filelist.txt", command=self.step_6).pack(side="left", padx=4)
+        tk.Button(btns, text="7) Обучение (start/continue)", command=self.step_7).pack(side="left", padx=4)
         row += 1
 
         self.pbar = ttk.Progressbar(frm, orient=tk.HORIZONTAL, mode='indeterminate', length=400)
@@ -1078,6 +1155,13 @@ class App:
         self.run_in_thread(job)
 
     def step_6(self):
+        def job():
+            root = self.root_var.get().strip()
+            project = self.project_var.get().strip()
+            generate_filelist(root, project, self.sr_var.get().strip(), self.write_log)
+        self.run_in_thread(job)
+
+    def step_7(self):
         def job():
             root = self.root_var.get().strip()
             project = self.project_var.get().strip()
