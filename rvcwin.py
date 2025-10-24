@@ -393,19 +393,72 @@ def pretrained_snowie_paths(root: str):
     d = os.path.join(assets_dir(root), "pretrained_v2", "48k", "Snowie", "D_SnowieV3.1_48k.pth")
     return g, d
 
+def find_trainer_script(repo_dir: str) -> str | None:
+    """Возвращает путь до тренировочного скрипта в различных форках WebUI."""
+
+    preferred = [
+        "train_nsf_sim_cache_sid_load_pretrain.py",
+        os.path.join("infer", "modules", "train", "train_nsf_sim_cache_sid_load_pretrain.py"),
+    ]
+
+    for rel in preferred:
+        candidate = os.path.join(repo_dir, rel)
+        if Path(candidate).exists():
+            return candidate
+
+    # Альтернативные названия, встречающиеся в свежих ветках.
+    alt_names = [
+        "train_nsf_sim_cache_sid_pretrain.py",
+        "train_nsf_sim_cache_sid.py",
+        "train.py",
+    ]
+    for rel in alt_names:
+        candidate = os.path.join(repo_dir, rel)
+        if Path(candidate).exists():
+            return candidate
+        # Также проверим common подпапку infer/modules/train
+        candidate = os.path.join(repo_dir, "infer", "modules", "train", rel)
+        if Path(candidate).exists():
+            return candidate
+
+    alt_subdirs = [
+        os.path.join(repo_dir, "train", "train.py"),
+        os.path.join(repo_dir, "scripts", "train.py"),
+    ]
+    for candidate in alt_subdirs:
+        if Path(candidate).exists():
+            return candidate
+
+    # Последний шанс — найти любой train_* с нужными аргументами.
+    key_markers = {"-e", "-sr", "-f0"}
+    for root_dir, _, files in os.walk(repo_dir):
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            if "train" not in name:
+                continue
+            full = os.path.join(root_dir, name)
+            try:
+                text = Path(full).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            if all(marker in text for marker in key_markers):
+                return full
+
+    return None
+
+
 def start_training(root: str, project: str, log, sr="48k", f0_flag="1", bs="6", te="300", se="25"):
     repo = webui_root(root)
     g, d = pretrained_snowie_paths(root)
 
-    # Наиболее совместимый тренер:
-    # train_nsf_sim_cache_sid_load_pretrain.py
-    trainer = os.path.join(repo, "train_nsf_sim_cache_sid_load_pretrain.py")
-    if not Path(trainer).exists():
-        # Некоторые ветки кладут тренер в корень infer/modules/train/...
-        alt = os.path.join(repo, "infer", "modules", "train", "train_nsf_sim_cache_sid_load_pretrain.py")
-        trainer = alt if Path(alt).exists() else None
-    if trainer is None or not Path(trainer).exists():
-        raise FileNotFoundError("Не найден train_nsf_sim_cache_sid_load_pretrain.py в вашем WebUI")
+    trainer = find_trainer_script(repo)
+    if trainer is None:
+        raise FileNotFoundError(
+            "Не найден подходящий тренировочный скрипт (train_nsf_sim_cache_sid_load_pretrain.py или аналог) в вашем WebUI"
+        )
+    else:
+        log(f"Тренировочный скрипт: {os.path.relpath(trainer, repo)}")
 
     if not Path(g).exists() or not Path(d).exists():
         log("[WARN] Предтрен Snowie не найден — обучение запустится с нуля.")
