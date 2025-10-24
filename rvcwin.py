@@ -167,8 +167,32 @@ def find_preprocess_script(repo_dir: str):
             return c
     return None
 
+def _resample_audio(data, src_sr: int, dst_sr: int):
+    """Пересэмплирует аудио-массив в целевую частоту."""
+    import numpy as np
+
+    arr = np.asarray(data, dtype="float32")
+    if src_sr == dst_sr:
+        return arr
+
+    try:
+        import soxr  # type: ignore
+
+        return soxr.resample(arr, src_sr, dst_sr)
+    except Exception:
+        try:
+            import librosa  # type: ignore
+
+            return librosa.resample(arr, orig_sr=src_sr, target_sr=dst_sr)
+        except Exception as exc:
+            raise RuntimeError(
+                "Для пересэмплинга в 16 кГц требуется пакет soxr или librosa. "
+                "Установите один из них (pip install soxr)."
+            ) from exc
+
+
 def slice_and_copy_dataset(root: str, project: str, input_wav: str, sr: str, log, chunk_ms=8000):
-    """Нарезаем входной WAV и копируем результат в 0_gt_wavs (как в колаб-скриптах)."""
+    """Нарезаем входной WAV, готовим 0_gt_wavs и 1_16k_wavs."""
     repo = webui_root(root)
     if not Path(input_wav).exists():
         raise FileNotFoundError(f"Не найден входной WAV: {input_wav}")
@@ -191,26 +215,34 @@ def slice_and_copy_dataset(root: str, project: str, input_wav: str, sr: str, log
     out_chunks = os.path.join(out_root, "chunks")
     Path(out_chunks).mkdir(parents=True, exist_ok=True)
 
+    gt_dir = os.path.join(logs_dir(root, project), "0_gt_wavs")
+    Path(gt_dir).mkdir(parents=True, exist_ok=True)
+
+    wav16_dir = os.path.join(logs_dir(root, project), "1_16k_wavs")
+    Path(wav16_dir).mkdir(parents=True, exist_ok=True)
+
     count = 0
     for i in range(0, len(data), hop):
         chunk = data[i:i+hop]
         if len(chunk) < hop // 3:  # коротыши не берём
             continue
         count += 1
-        outp = os.path.join(out_chunks, f"{project}_{count:05d}.wav")
+        name = f"{project}_{count:05d}.wav"
+        outp = os.path.join(out_chunks, name)
         sf.write(outp, chunk, in_sr)
+
+        # 0_gt_wavs — оригинальная частота
+        shutil.copy2(outp, os.path.join(gt_dir, name))
+
+        # 1_16k_wavs — обязательно для rmvpe на Windows
+        chunk16 = _resample_audio(chunk, in_sr, 16000).astype("float32")
+        sf.write(os.path.join(wav16_dir, name), chunk16, 16000)
         if count % 50 == 0:
             log(f"Чанк {count}")
 
     log(f"Нарезка завершена, сегментов: {count}")
-
-    # Скопируем в 0_gt_wavs, как ожидают многие тренеры
-    gt_dir = os.path.join(logs_dir(root, project), "0_gt_wavs")
-    Path(gt_dir).mkdir(parents=True, exist_ok=True)
-    for fn in os.listdir(out_chunks):
-        if fn.lower().endswith(".wav"):
-            shutil.copy2(os.path.join(out_chunks, fn), os.path.join(gt_dir, fn))
     log(f"Готово: скопировано в {gt_dir}")
+    log(f"Готово: создано {wav16_dir}")
 
 def preprocess_with_webui(root: str, project: str, sr: str, log):
     """Запуск trainset_preprocess_xxx.py (если есть). Иначе пропускаем (мы уже нарезали)."""
