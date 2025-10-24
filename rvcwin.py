@@ -17,6 +17,7 @@
 # ВНИМАНИЕ: fairseq2/fairseq2n на Windows обычно без готовых колес; используем HuBERT.
 #            (колеса fairseq2n официально только для Linux). см. ссылки в описании.
 #
+import json
 import os
 import sys
 import re
@@ -155,6 +156,99 @@ def _normalize_sr_tokens(sr: str) -> list[str]:
     return result
 
 
+DEFAULT_TRAIN_BLOCK = {
+    "log_interval": 200,
+    "seed": 1234,
+    "epochs": 20000,
+    "learning_rate": 1e-4,
+    "betas": [0.8, 0.99],
+    "eps": 1e-9,
+    "batch_size": 4,
+    "fp16_run": True,
+    "lr_decay": 0.999875,
+    "segment_size": 17280,
+    "init_lr_ratio": 1,
+    "warmup_epochs": 0,
+    "c_mel": 45,
+    "c_kl": 1.0,
+}
+
+
+def _iter_config_templates(repo: Path, sr: str):
+    tokens = _normalize_sr_tokens(sr)
+    directories = [
+        Path("configs"),
+        Path("configs") / "v2",
+        Path("configs") / "v1",
+        Path("configs") / "inuse",
+    ]
+    suffixes = ["", "_v2", "_v1"]
+
+    seen: set[Path] = set()
+    for token in tokens:
+        base = token.strip()
+        if not base:
+            continue
+        for suffix in suffixes:
+            filename = f"{base}{suffix}.json"
+            for directory in directories:
+                candidate = repo / directory / filename
+                if candidate not in seen:
+                    seen.add(candidate)
+                    yield candidate
+
+    fallback = repo / "configs" / "config.json"
+    if fallback not in seen:
+        yield fallback
+
+
+def _config_has_train(path: Path) -> bool:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return False
+    return isinstance(data, dict) and isinstance(data.get("train"), dict)
+
+
+def _ensure_train_block(cfg_path: Path, log) -> None:
+    try:
+        with cfg_path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        if log:
+            log(f"[WARN] Не удалось проверить config.json: {exc}")
+        return
+
+    if not isinstance(data, dict):
+        if log:
+            log("[WARN] config.json имеет неожиданный формат — пропускаем правку.")
+        return
+
+    train = data.get("train")
+    changed = False
+    if not isinstance(train, dict):
+        train = {}
+        data["train"] = train
+        changed = True
+
+    for key, value in DEFAULT_TRAIN_BLOCK.items():
+        if key not in train:
+            train[key] = value
+            changed = True
+
+    if changed:
+        try:
+            with cfg_path.open("w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            if log:
+                log(f"[WARN] Не удалось обновить config.json: {exc}")
+            return
+        if log:
+            log("[INFO] Секция train дополнена значениями по умолчанию.")
+
+
 def ensure_config_json(root: str, project: str, sr: str, log) -> Path:
     """Создаёт logs/<project>/config.json из шаблона, если файл отсутствует."""
 
@@ -163,24 +257,27 @@ def ensure_config_json(root: str, project: str, sr: str, log) -> Path:
     if cfg_path.exists():
         if log:
             log("config.json уже существует — пропускаем копирование шаблона.")
+        _ensure_train_block(cfg_path, log)
         return cfg_path
 
     repo = Path(webui_root(root))
-    candidates: list[Path] = []
-    for token in _normalize_sr_tokens(sr):
-        candidates.append(repo / "configs" / f"{token}.json")
-        candidates.append(repo / "configs" / f"{token}_v2.json")
-        candidates.append(repo / "configs" / f"{token}_v1.json")
+    template: Path | None = None
+    fallback: Path | None = None
+    for candidate in _iter_config_templates(repo, sr):
+        if not candidate.exists():
+            continue
+        if _config_has_train(candidate):
+            template = candidate
+            break
+        if fallback is None:
+            fallback = candidate
 
-    # На случай, если названия шаблонов отличаются от стандартных.
-    candidates.append(repo / "configs" / "48k_v2.json")
-    candidates.append(repo / "configs" / "config.json")
-
-    template = next((path for path in candidates if path.exists()), None)
     if template is None:
-        raise FileNotFoundError(
-            "Не найден шаблон конфигурации (configs/<sr>.json) в WebUI."
-        )
+        if fallback is None:
+            raise FileNotFoundError(
+                "Не найден шаблон конфигурации (configs/<sr>.json) в WebUI."
+            )
+        template = fallback
 
     logs_path.mkdir(parents=True, exist_ok=True)
     shutil.copy2(template, cfg_path)
@@ -190,6 +287,8 @@ def ensure_config_json(root: str, project: str, sr: str, log) -> Path:
         rel_template = template
     if log:
         log(f"Создан config.json из шаблона {rel_template}.")
+
+    _ensure_train_block(cfg_path, log)
     return cfg_path
 
 def is_git_repo(path: str) -> bool:
