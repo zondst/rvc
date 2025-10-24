@@ -5,6 +5,7 @@ Retrieval-based-Voice-Conversion-WebUI при извлечении фичей Hu
 """
 
 from . import checkpoint_utils  # noqa: F401
+from . import data  # noqa: F401
 from . import modules  # noqa: F401
 
-__all__ = ["checkpoint_utils", "modules"]
+__all__ = ["checkpoint_utils", "data", "modules"]
