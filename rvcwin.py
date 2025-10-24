@@ -923,8 +923,8 @@ def ensure_trainer_pretrain_patch(trainer_path: str, log) -> None:
         log(f"[WARN] Не удалось прочитать {trainer_path}: {exc}")
         return
 
-    if "load_state_dict(sd, strict=False)" in text:
-        # Патч уже применён
+    if "weights_only=True" in text and "load_state_dict(sd, strict=False)" in text:
+        # Похоже, что патч уже применён (есть и weights_only, и strict=False)
         return
 
     pattern = re.compile(
@@ -938,16 +938,27 @@ def ensure_trainer_pretrain_patch(trainer_path: str, log) -> None:
         prefix = match.group("prefix")
         args = match.group("args").strip()
 
-        if "weights_only" not in args:
-            if args.endswith(","):
-                args = f"{args} weights_only=True"
-            elif args:
-                args = f"{args}, weights_only=True"
+        weights_args = args
+        if "weights_only" not in weights_args:
+            if weights_args.endswith(","):
+                weights_args = f"{weights_args} weights_only=True"
+            elif weights_args:
+                weights_args = f"{weights_args}, weights_only=True"
             else:
-                args = "weights_only=True"
+                weights_args = "weights_only=True"
+
+        inner_indent = f"{indent}    "
+
+        if args:
+            fallback_call = f"{inner_indent}sd = torch.load({args})"
+        else:
+            fallback_call = f"{inner_indent}sd = torch.load()"
 
         body = [
-            f"{indent}sd = torch.load({args})",
+            f"{indent}try:",
+            f"{inner_indent}sd = torch.load({weights_args})",
+            f"{indent}except TypeError:",
+            fallback_call,
             f'{indent}sd = sd.get("model", sd)',
             f"{indent}{prefix}.load_state_dict(sd, strict=False)",
         ]
@@ -965,7 +976,7 @@ def ensure_trainer_pretrain_patch(trainer_path: str, log) -> None:
         log(f"[WARN] Не удалось записать патч в {trainer_path}: {exc}")
         return
 
-    log("Применён патч загрузки предтренов (strict=False + weights_only=True).")
+    log("Применён безопасный патч загрузки предтренов (weights_only + fallback + strict=False).")
 
 
 
